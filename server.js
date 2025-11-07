@@ -6,9 +6,8 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 
-// IMPORTANT: REPLACE THE STAR (*) BELOW with your actual GitHub Pages URL 
-// Example: const CLIENT_URL = "https://yourusername.github.io/the-game-of-lowlife/";
-const CLIENT_URL = "*"; 
+// CRITICAL FIX: Setting the CLIENT_URL to the exact GitHub Pages path
+const CLIENT_URL = "https://jamesbergeron99.github.io/The-Game-Of-Lowlife/"; 
 
 const io = new Server(server, {
     cors: {
@@ -39,7 +38,7 @@ function initializeGame(code, names, numPlayers) {
     const shuffledCharacters = CHARACTERS.sort(() => 0.5 - Math.random()); // Simple shuffle for character assignment
 
     const players = playerNames.map((name, i) => ({
-        id: io.sockets.adapter.rooms.get(code) ? Array.from(io.sockets.adapter.rooms.get(code))[i] : `p${i + 1}`, // Attempts to use actual socket IDs for turn logic
+        id: io.sockets.adapter.rooms.get(code) ? Array.from(io.sockets.adapter.rooms.get(code))[i] : `p${i + 1}`,
         name: name,
         character: shuffledCharacters[i % shuffledCharacters.length],
         position: 0,
@@ -137,9 +136,6 @@ io.on('connection', (socket) => {
 
         // --- CORE GAME LOGIC GOES HERE ---
         const roll = Math.floor(Math.random() * 10) + 1;
-        
-        // This is where you call your server-side versions of:
-        // moveBy(game.players[game.current], roll);
         
         // Example logic placeholder: move and advance turn
         game.players[game.current].position = (game.players[game.current].position + roll) % 100; // Assuming 100 squares
