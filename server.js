@@ -7,7 +7,7 @@ const app = express();
 const server = http.createServer(app);
 
 // CRITICAL FIX: Setting the CLIENT_URL to the exact GitHub Pages path
-const CLIENT_URL = "https://jamesbergeron99.github.io/The-Game-Of-Lowlife/"; 
+const CLIENT_URL = "https://jamesbergeron99.github.io/The-Game-Of-Lowlife-free/"; 
 
 const io = new Server(server, {
     cors: {
@@ -16,7 +16,7 @@ const io = new Server(server, {
     }
 });
 
-const PORT = process.env.PORT || 3000;
+// The PORT variable is now passed to the server.listen block directly below
 const games = {}; // Stores all active game states by code
 
 // Helper: Generates a simple 4-character code
@@ -154,6 +154,7 @@ io.on('connection', (socket) => {
     });
 });
 
-server.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+// FINAL FIX: Ensure the server listens to the port provided by the hosting environment (Render)
+server.listen(process.env.PORT || 3000, () => {
+    console.log(`Server listening on port ${process.env.PORT || 3000}`);
 });
