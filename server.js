@@ -1,136 +1,185 @@
-// server.js — Fixed Join + Start Game Logic (v3)
-import express from "express";
-import http from "http";
-import { Server } from "socket.io";
-import cors from "cors";
+// server.js
+// Minimal Socket.IO server for "The Game of Lowlife"
+// Run: 1) npm install  2) node server.js  (or use a host like Render/Railway/Replit)
+
+const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const cors = require("cors");
 
 const app = express();
+app.use(cors());
 const server = http.createServer(app);
-
-const allowedOrigins = [
-  "https://jamesbergeron99.github.io",
-  "https://jamesbergeron99.github.io/The-Game-Of-Lowlife-free/"
-];
-
-app.use(cors({
-  origin: allowedOrigins,
-  methods: ["GET", "POST"]
-}));
-
 const io = new Server(server, {
-  cors: {
-    origin: allowedOrigins,
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
 const PORT = process.env.PORT || 3000;
-const games = {}; // all active games
 
+// --- In-memory rooms ---
+/*
+room = {
+  code: "ABCD",
+  hostId: <socket.id>,
+  started: false,
+  firstFinisherAwarded: false,
+  players: [{ sid, id, name }],
+  // Random sources controlled by server:
+  tardDeck: [...strings...],   // shuffled order (indexes match client deck text)
+  tardPtr: 0
+}
+*/
+const rooms = new Map();
+
+// Utility
+function makeCode() {
+  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let s = "";
+  for (let i = 0; i < 4; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return rooms.has(s) ? makeCode() : s;
+}
+
+// On connect
 io.on("connection", (socket) => {
-  console.log("✅ User connected:", socket.id);
-
-  // --- CREATE GAME ---
-  socket.on("createGame", () => {
-    const code = Math.random().toString(36).substring(2, 6).toUpperCase();
-    games[code] = {
-      host: socket.id,
-      players: [],
+  // Create room
+  socket.on("createRoom", (_, cb) => {
+    const code = makeCode();
+    rooms.set(code, {
+      code,
+      hostId: socket.id,
       started: false,
-      numPlayers: 2
-    };
+      firstFinisherAwarded: false,
+      players: [],
+      tardDeck: [], // client will send deck text once (stable)
+      tardPtr: 0,
+    });
     socket.join(code);
-    console.log(`🎮 Game created: ${code}`);
-    socket.emit("gameCreated", { code, isHost: true, numPlayers: 2 });
+    cb && cb({ ok: true, code, isHost: true });
   });
 
-  // --- UPDATE SETTINGS ---
-  socket.on("updateSettings", ({ code, numPlayers }) => {
-    const game = games[code];
-    if (!game || socket.id !== game.host) return;
-    game.numPlayers = numPlayers;
-    io.to(code).emit("settingsUpdate", numPlayers);
-  });
+  // Join room
+  socket.on("joinRoom", ({ code, name, tardDeckSeed }, cb) => {
+    const room = rooms.get(String(code || "").toUpperCase());
+    if (!room) return cb && cb({ ok: false, error: "Room not found" });
+    if (room.started) return cb && cb({ ok: false, error: "Game already started" });
+    if (room.players.length >= 8) return cb && cb({ ok: false, error: "Room is full" });
 
-  // --- JOIN GAME ---
-  socket.on("joinGame", ({ code, name }) => {
-    const game = games[code];
-    if (!game) {
-      socket.emit("errorMessage", "Game not found");
-      return;
+    socket.join(room.code);
+    const id = room.players.length + 1;
+    room.players.push({ sid: socket.id, id, name: name?.trim() || `Player ${id}` });
+
+    // If tard deck not initialized, accept client seed (the full ordered list).
+    if (!room.tardDeck?.length && Array.isArray(tardDeckSeed) && tardDeckSeed.length >= 10) {
+      // Simple shuffle that both sides can accept as "server chosen":
+      room.tardDeck = [...tardDeckSeed].sort(() => Math.random() - 0.5);
+      room.tardPtr = 0;
     }
-    if (game.started) {
-      socket.emit("errorMessage", "Game already started");
-      return;
-    }
-    const player = {
-      id: socket.id,
-      name: name || `Player${game.players.length + 1}`,
-      money: 0,
-      position: 0
-    };
-    game.players.push(player);
-    socket.join(code);
-    console.log(`👤 ${player.name} joined ${code}`);
-    socket.emit("gameJoined", { code, isHost: socket.id === game.host, numPlayers: game.numPlayers });
-    io.to(code).emit("lobbyUpdate", game.players);
+
+    io.to(room.code).emit("lobbyUpdate", {
+      players: room.players.map((p) => ({ id: p.id, name: p.name })),
+      hostId: room.hostId,
+      code: room.code,
+    });
+    cb && cb({ ok: true, id, isHost: socket.id === room.hostId });
   });
 
-  // --- START GAME ---
-  socket.on("startGame", ({ code }) => {
-    const game = games[code];
-    if (!game || socket.id !== game.host) return;
-    if (game.players.length < 1) return;
+  // Start game (host only). Server just flags started; clients build identical initial state.
+  socket.on("startGame", ({ code }, cb) => {
+    const room = rooms.get(String(code || "").toUpperCase());
+    if (!room) return cb && cb({ ok: false, error: "Room not found" });
+    if (socket.id !== room.hostId) return cb && cb({ ok: false, error: "Only host can start" });
+    if (room.players.length < 2) return cb && cb({ ok: false, error: "Need at least 2 players" });
 
-    game.started = true;
-    game.current = 0;
-
-    // ensure everyone has a player object
-    game.players = game.players.map((p, i) => ({
-      ...p,
-      id: p.id || `bot-${i}`,
-      name: p.name || `Player ${i + 1}`,
-      money: 0,
-      position: 0,
-      lastRoll: 0
-    }));
-
-    console.log(`🚀 Game ${code} started with ${game.players.length} players`);
-    io.to(code).emit("gameStarted", game);
+    room.started = true;
+    room.firstFinisherAwarded = false;
+    io.to(room.code).emit("gameStarted", {
+      players: room.players.map((p) => ({ id: p.id, name: p.name })),
+      tardDeck: room.tardDeck,
+    });
+    cb && cb({ ok: true });
   });
 
-  // --- PLAYER SPIN ---
-  socket.on("playerSpin", ({ code }) => {
-    const game = games[code];
-    if (!game || !game.started) return;
-    const player = game.players[game.current];
-    if (!player) return;
-
+  // Authoritative random: movement spin
+  socket.on("requestMoveSpin", ({ code, playerId }, cb) => {
+    const room = rooms.get(String(code || "").toUpperCase());
+    if (!room || !room.started) return cb && cb({ ok: false });
     const roll = Math.floor(Math.random() * 10) + 1;
-    player.position = Math.min(player.position + roll, 99);
-    player.lastRoll = roll;
-
-    // move to next player
-    game.current = (game.current + 1) % game.players.length;
-    console.log(`🎲 ${player.name} rolled ${roll} in ${code}`);
-    io.to(code).emit("gameStateUpdate", game);
+    io.to(room.code).emit("serverMoveSpin", { playerId, roll });
+    cb && cb({ ok: true, roll });
   });
 
-  // --- DISCONNECT ---
+  // Authoritative random: extra spin (extortion/payoff/other ×multiplier)
+  socket.on("requestExtraSpin", ({ code, playerId, multiplier }, cb) => {
+    const room = rooms.get(String(code || "").toUpperCase());
+    if (!room || !room.started) return cb && cb({ ok: false });
+    const roll = Math.floor(Math.random() * 10) + 1;
+    const amount = roll * (Number(multiplier) || 1);
+    io.to(room.code).emit("serverExtraSpin", { playerId, roll, amount, multiplier });
+    cb && cb({ ok: true, roll, amount });
+  });
+
+  // Authoritative random: bankruptcy rescue
+  socket.on("requestRescueSpin", ({ code, playerId }, cb) => {
+    const room = rooms.get(String(code || "").toUpperCase());
+    if (!room || !room.started) return cb && cb({ ok: false });
+    const roll = Math.floor(Math.random() * 10) + 1;
+    io.to(room.code).emit("serverRescueSpin", { playerId, roll });
+    cb && cb({ ok: true, roll });
+  });
+
+  // Authoritative random: TARD draw
+  socket.on("requestTardDraw", ({ code, playerId }, cb) => {
+    const room = rooms.get(String(code || "").toUpperCase());
+    if (!room || !room.started) return cb && cb({ ok: false });
+    if (!room.tardDeck?.length) return cb && cb({ ok: false, error: "No deck" });
+
+    if (room.tardPtr >= room.tardDeck.length) {
+      // reshuffle
+      room.tardDeck = [...room.tardDeck].sort(() => Math.random() - 0.5);
+      room.tardPtr = 0;
+    }
+    const card = room.tardDeck[room.tardPtr++];
+    io.to(room.code).emit("serverTardDraw", { playerId, card, remaining: room.tardDeck.length - room.tardPtr });
+    cb && cb({ ok: true, card, remaining: room.tardDeck.length - room.tardPtr });
+  });
+
+  // Finish bonus claim (first come first served)
+  socket.on("claimFinishBonus", ({ code, playerId }, cb) => {
+    const room = rooms.get(String(code || "").toUpperCase());
+    if (!room || !room.started) return cb && cb({ ok: false });
+    if (room.firstFinisherAwarded) return cb && cb({ ok: false, already: true });
+    room.firstFinisherAwarded = true;
+    io.to(room.code).emit("finishBonusAwarded", { playerId, amount: 5000 });
+    cb && cb({ ok: true, amount: 5000 });
+  });
+
+  // Disconnection cleanup
   socket.on("disconnect", () => {
-    console.log("❌ Disconnected:", socket.id);
-    for (const code in games) {
-      const game = games[code];
-      game.players = game.players.filter((p) => p.id !== socket.id);
-      io.to(code).emit("lobbyUpdate", game.players);
+    // Remove from any rooms
+    for (const [code, room] of rooms) {
+      const before = room.players.length;
+      room.players = room.players.filter((p) => p.sid !== socket.id);
+      if (before !== room.players.length) {
+        // Announce lobby update
+        io.to(code).emit("lobbyUpdate", {
+          players: room.players.map((p) => ({ id: p.id, name: p.name })),
+          hostId: room.hostId,
+          code: room.code,
+        });
+      }
+      // If host left and room not started, promote first player (if any)
+      if (!room.started && room.players.length && room.hostId === socket.id) {
+        room.hostId = room.players[0].sid;
+        io.to(code).emit("lobbyUpdate", {
+          players: room.players.map((p) => ({ id: p.id, name: p.name })),
+          hostId: room.hostId,
+          code: room.code,
+        });
+      }
+      // If room empty, delete
+      if (!room.players.length) rooms.delete(code);
     }
   });
 });
 
-app.get("/", (req, res) => {
-  res.send("✅ LowLife server online. Ready for Create + Join Game connections.");
-});
-
-server.listen(PORT, () => {
-  console.log(`✅ Server listening on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Lowlife server running on :${PORT}`));

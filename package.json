@@ -1,13 +1,16 @@
 {
-  "name": "lowlife-server",
+  "name": "lowlife-mp-server",
   "version": "1.0.0",
-  "description": "Backend server for The Game of Lowlife.",
+  "description": "Authoritative Socket.IO server for The Game of Lowlife",
   "main": "server.js",
+  "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.7.4"
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5"
   }
 }
