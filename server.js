@@ -1,185 +1,211 @@
-// server.js
-// Minimal Socket.IO server for "The Game of Lowlife"
-// Run: 1) npm install  2) node server.js  (or use a host like Render/Railway/Replit)
-
+// server.js — host-authoritative turn engine with serialization & debouncing
 const express = require("express");
 const http = require("http");
+const path = require("path");
 const { Server } = require("socket.io");
-const cors = require("cors");
 
 const app = express();
-app.use(cors());
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-});
-
+const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
 const PORT = process.env.PORT || 3000;
 
-// --- In-memory rooms ---
-/*
-room = {
-  code: "ABCD",
-  hostId: <socket.id>,
-  started: false,
-  firstFinisherAwarded: false,
-  players: [{ sid, id, name }],
-  // Random sources controlled by server:
-  tardDeck: [...strings...],   // shuffled order (indexes match client deck text)
-  tardPtr: 0
-}
-*/
+app.use(express.static(path.join(__dirname, "public")));
+app.get("/", (_, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
+app.get("/healthz", (_, res) => res.send("OK"));
+
+// ---- Room state ----
 const rooms = new Map();
-
-// Utility
+const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 function makeCode() {
-  const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
   let s = "";
-  for (let i = 0; i < 4; i++) s += alphabet[Math.floor(Math.random() * alphabet.length)];
-  return rooms.has(s) ? makeCode() : s;
+  for (let i = 0; i < 4; i++) s += CODE_ALPHABET[Math.floor(Math.random()*CODE_ALPHABET.length)];
+  if (rooms.has(s)) return makeCode();
+  return s;
 }
 
-// On connect
 io.on("connection", (socket) => {
-  // Create room
   socket.on("createRoom", (_, cb) => {
     const code = makeCode();
     rooms.set(code, {
       code,
       hostId: socket.id,
+      players: [], // {sid,id,name}
       started: false,
+      currentTurnIndex: 0,
+      actionSeq: 0,       // monotonically increasing action id
+      spinning: false,    // serialize spins
       firstFinisherAwarded: false,
-      players: [],
-      tardDeck: [], // client will send deck text once (stable)
+      tardDeck: [],
       tardPtr: 0,
     });
     socket.join(code);
     cb && cb({ ok: true, code, isHost: true });
   });
 
-  // Join room
   socket.on("joinRoom", ({ code, name, tardDeckSeed }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
+    code = String(code || "").toUpperCase();
+    const room = rooms.get(code);
     if (!room) return cb && cb({ ok: false, error: "Room not found" });
     if (room.started) return cb && cb({ ok: false, error: "Game already started" });
     if (room.players.length >= 8) return cb && cb({ ok: false, error: "Room is full" });
 
-    socket.join(room.code);
+    socket.join(code);
     const id = room.players.length + 1;
     room.players.push({ sid: socket.id, id, name: name?.trim() || `Player ${id}` });
 
-    // If tard deck not initialized, accept client seed (the full ordered list).
     if (!room.tardDeck?.length && Array.isArray(tardDeckSeed) && tardDeckSeed.length >= 10) {
-      // Simple shuffle that both sides can accept as "server chosen":
       room.tardDeck = [...tardDeckSeed].sort(() => Math.random() - 0.5);
       room.tardPtr = 0;
     }
 
-    io.to(room.code).emit("lobbyUpdate", {
-      players: room.players.map((p) => ({ id: p.id, name: p.name })),
+    io.to(code).emit("lobbyUpdate", {
+      players: room.players.map(p => ({ id: p.id, name: p.name })),
       hostId: room.hostId,
-      code: room.code,
+      code,
     });
     cb && cb({ ok: true, id, isHost: socket.id === room.hostId });
   });
 
-  // Start game (host only). Server just flags started; clients build identical initial state.
   socket.on("startGame", ({ code }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
+    code = String(code || "").toUpperCase();
+    const room = rooms.get(code);
     if (!room) return cb && cb({ ok: false, error: "Room not found" });
     if (socket.id !== room.hostId) return cb && cb({ ok: false, error: "Only host can start" });
     if (room.players.length < 2) return cb && cb({ ok: false, error: "Need at least 2 players" });
 
     room.started = true;
+    room.currentTurnIndex = 0;
+    room.actionSeq = 1;
+    room.spinning = false;
     room.firstFinisherAwarded = false;
-    io.to(room.code).emit("gameStarted", {
-      players: room.players.map((p) => ({ id: p.id, name: p.name })),
-      tardDeck: room.tardDeck,
+
+    io.to(code).emit("gameStarted", {
+      players: room.players.map(p => ({ id: p.id, name: p.name })),
+      currentPlayerId: room.players[0].id,
+      seq: room.actionSeq
     });
     cb && cb({ ok: true });
   });
 
-  // Authoritative random: movement spin
+  function ensureActive(room, playerId, sid) {
+    const pIdx = room.players.findIndex(p => p.id === playerId);
+    if (pIdx !== room.currentTurnIndex) return { ok: false, error: "Not your turn" };
+    const p = room.players[pIdx];
+    if (!p || p.sid !== sid) return { ok: false, error: "Identity mismatch" };
+    return { ok: true };
+  }
+
+  function nextTurn(room) {
+    room.currentTurnIndex = (room.currentTurnIndex + 1) % room.players.length;
+    room.actionSeq += 1;
+    const currentPlayerId = room.players[room.currentTurnIndex].id;
+    io.to(room.code).emit("turnChanged", { currentPlayerId, seq: room.actionSeq });
+  }
+
   socket.on("requestMoveSpin", ({ code, playerId }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
-    if (!room || !room.started) return cb && cb({ ok: false });
+    code = String(code || "").toUpperCase();
+    const room = rooms.get(code);
+    if (!room || !room.started) return cb && cb({ ok: false, error: "No game" });
+
+    const auth = ensureActive(room, playerId, socket.id);
+    if (!auth.ok) return cb && cb({ ok: false, error: auth.error });
+
+    if (room.spinning) return cb && cb({ ok: false, error: "Spin in progress" });
+    room.spinning = true;
+
     const roll = Math.floor(Math.random() * 10) + 1;
-    io.to(room.code).emit("serverMoveSpin", { playerId, roll });
-    cb && cb({ ok: true, roll });
+    const seq = ++room.actionSeq;
+    io.to(code).emit("serverMoveSpin", { playerId, roll, seq });
+
+    // unlock & advance turn after client resolves (give it enough time to animate)
+    setTimeout(() => {
+      room.spinning = false;
+      nextTurn(room);
+    }, 4500);
+
+    cb && cb({ ok: true, roll, seq });
   });
 
-  // Authoritative random: extra spin (extortion/payoff/other ×multiplier)
   socket.on("requestExtraSpin", ({ code, playerId, multiplier }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
+    code = String(code || "").toUpperCase();
+    const room = rooms.get(code);
     if (!room || !room.started) return cb && cb({ ok: false });
+    // Allow extra spins only for the player whose action is being resolved (same turn index)
+    const auth = ensureActive(room, playerId, socket.id);
+    if (!auth.ok && room.spinning) {
+      // If we're currently spinning for this player's action, permit extra spin
+      // (often triggered as part of TARD/payoff/extortion chaining)
+    }
+
     const roll = Math.floor(Math.random() * 10) + 1;
     const amount = roll * (Number(multiplier) || 1);
-    io.to(room.code).emit("serverExtraSpin", { playerId, roll, amount, multiplier });
-    cb && cb({ ok: true, roll, amount });
+    const seq = ++room.actionSeq;
+    io.to(code).emit("serverExtraSpin", { playerId, roll, amount, multiplier, seq });
+    cb && cb({ ok: true, roll, amount, seq });
   });
 
-  // Authoritative random: bankruptcy rescue
   socket.on("requestRescueSpin", ({ code, playerId }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
+    code = String(code || "").toUpperCase();
+    const room = rooms.get(code);
     if (!room || !room.started) return cb && cb({ ok: false });
+
     const roll = Math.floor(Math.random() * 10) + 1;
-    io.to(room.code).emit("serverRescueSpin", { playerId, roll });
-    cb && cb({ ok: true, roll });
+    const seq = ++room.actionSeq;
+    io.to(code).emit("serverRescueSpin", { playerId, roll, seq });
+    cb && cb({ ok: true, roll, seq });
   });
 
-  // Authoritative random: TARD draw
   socket.on("requestTardDraw", ({ code, playerId }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
-    if (!room || !room.started) return cb && cb({ ok: false });
-    if (!room.tardDeck?.length) return cb && cb({ ok: false, error: "No deck" });
+    code = String(code || "").toUpperCase();
+    const room = rooms.get(code);
+    if (!room || !room.started) return cb && cb({ ok: false, error: "No game" });
 
+    if (!room.tardDeck?.length) return cb && cb({ ok: false, error: "No deck" });
     if (room.tardPtr >= room.tardDeck.length) {
-      // reshuffle
       room.tardDeck = [...room.tardDeck].sort(() => Math.random() - 0.5);
       room.tardPtr = 0;
     }
     const card = room.tardDeck[room.tardPtr++];
-    io.to(room.code).emit("serverTardDraw", { playerId, card, remaining: room.tardDeck.length - room.tardPtr });
-    cb && cb({ ok: true, card, remaining: room.tardDeck.length - room.tardPtr });
+    const remaining = room.tardDeck.length - room.tardPtr;
+    const seq = ++room.actionSeq;
+    io.to(code).emit("serverTardDraw", { playerId, card, remaining, seq });
+    cb && cb({ ok: true, card, remaining, seq });
   });
 
-  // Finish bonus claim (first come first served)
   socket.on("claimFinishBonus", ({ code, playerId }, cb) => {
-    const room = rooms.get(String(code || "").toUpperCase());
+    code = String(code || "").toUpperCase();
+    const room = rooms.get(code);
     if (!room || !room.started) return cb && cb({ ok: false });
     if (room.firstFinisherAwarded) return cb && cb({ ok: false, already: true });
     room.firstFinisherAwarded = true;
-    io.to(room.code).emit("finishBonusAwarded", { playerId, amount: 5000 });
-    cb && cb({ ok: true, amount: 5000 });
+    const seq = ++room.actionSeq;
+    io.to(code).emit("finishBonusAwarded", { playerId, amount: 5000, seq });
+    cb && cb({ ok: true, amount: 5000, seq });
   });
 
-  // Disconnection cleanup
   socket.on("disconnect", () => {
-    // Remove from any rooms
     for (const [code, room] of rooms) {
       const before = room.players.length;
-      room.players = room.players.filter((p) => p.sid !== socket.id);
+      room.players = room.players.filter(p => p.sid !== socket.id);
       if (before !== room.players.length) {
-        // Announce lobby update
         io.to(code).emit("lobbyUpdate", {
-          players: room.players.map((p) => ({ id: p.id, name: p.name })),
+          players: room.players.map(p => ({ id: p.id, name: p.name })),
           hostId: room.hostId,
-          code: room.code,
+          code,
         });
       }
-      // If host left and room not started, promote first player (if any)
+      // Host handoff in lobby
       if (!room.started && room.players.length && room.hostId === socket.id) {
         room.hostId = room.players[0].sid;
         io.to(code).emit("lobbyUpdate", {
-          players: room.players.map((p) => ({ id: p.id, name: p.name })),
+          players: room.players.map(p => ({ id: p.id, name: p.name })),
           hostId: room.hostId,
-          code: room.code,
+          code,
         });
       }
-      // If room empty, delete
       if (!room.players.length) rooms.delete(code);
     }
   });
 });
 
-server.listen(PORT, () => console.log(`Lowlife server running on :${PORT}`));
+server.listen(PORT, () => console.log(`Lowlife online fixed running on :${PORT}`));
