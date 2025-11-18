@@ -1,211 +1,215 @@
-// server.js — host-authoritative turn engine with serialization & debouncing
+// server.js
+
 const express = require("express");
 const http = require("http");
-const path = require("path");
 const { Server } = require("socket.io");
+const cors = require("cors");
 
+// ----- Basic Express setup -----
 const app = express();
+
+// Allow JSON if you ever add REST endpoints
+app.use(express.json());
+
+// CORS for any origin (we can tighten this later if you want)
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST"],
+  })
+);
+
+// Simple health check (so hitting the root URL doesn't 404)
+app.get("/", (req, res) => {
+  res.send("LowLife server is running.");
+});
+
+// ----- Create HTTP + Socket.IO server -----
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
-const PORT = process.env.PORT || 3000;
 
-app.use(express.static(path.join(__dirname, "public")));
-app.get("/", (_, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
-app.get("/healthz", (_, res) => res.send("OK"));
+const io = new Server(server, {
+  cors: {
+    origin: "*", // IMPORTANT: this avoids the Access-Control-Allow-Origin mismatch
+    methods: ["GET", "POST"],
+  },
+});
 
-// ---- Room state ----
-const rooms = new Map();
-const CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-function makeCode() {
-  let s = "";
-  for (let i = 0; i < 4; i++) s += CODE_ALPHABET[Math.floor(Math.random()*CODE_ALPHABET.length)];
-  if (rooms.has(s)) return makeCode();
-  return s;
+// In-memory game store
+// games[code] = { code, hostId, players: [{ id, name }], started: false }
+const games = {};
+
+// Utility to generate a 5-character game code (e.g., AB3D9)
+function generateGameCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid confusing chars
+  let code = "";
+  for (let i = 0; i < 5; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
 }
 
+// Make sure code is unique (for this server instance)
+function createUniqueCode() {
+  let code;
+  do {
+    code = generateGameCode();
+  } while (games[code]);
+  return code;
+}
+
+// ----- Socket.IO logic -----
 io.on("connection", (socket) => {
-  socket.on("createRoom", (_, cb) => {
-    const code = makeCode();
-    rooms.set(code, {
-      code,
-      hostId: socket.id,
-      players: [], // {sid,id,name}
-      started: false,
-      currentTurnIndex: 0,
-      actionSeq: 0,       // monotonically increasing action id
-      spinning: false,    // serialize spins
-      firstFinisherAwarded: false,
-      tardDeck: [],
-      tardPtr: 0,
-    });
-    socket.join(code);
-    cb && cb({ ok: true, code, isHost: true });
-  });
+  console.log("Client connected:", socket.id);
 
-  socket.on("joinRoom", ({ code, name, tardDeckSeed }, cb) => {
-    code = String(code || "").toUpperCase();
-    const room = rooms.get(code);
-    if (!room) return cb && cb({ ok: false, error: "Room not found" });
-    if (room.started) return cb && cb({ ok: false, error: "Game already started" });
-    if (room.players.length >= 8) return cb && cb({ ok: false, error: "Room is full" });
+  // Host creates a game
+  socket.on("createGame", (payload) => {
+    try {
+      const code = createUniqueCode();
 
-    socket.join(code);
-    const id = room.players.length + 1;
-    room.players.push({ sid: socket.id, id, name: name?.trim() || `Player ${id}` });
+      games[code] = {
+        code,
+        hostId: socket.id,
+        players: [],
+        started: false,
+      };
 
-    if (!room.tardDeck?.length && Array.isArray(tardDeckSeed) && tardDeckSeed.length >= 10) {
-      room.tardDeck = [...tardDeckSeed].sort(() => Math.random() - 0.5);
-      room.tardPtr = 0;
+      socket.join(code);
+
+      console.log(`Game created: ${code} by host ${socket.id}`);
+
+      // Send code back to the creator
+      // (Your client should listen for either "gameCreated" or "gameCode")
+      socket.emit("gameCreated", { code });
+      socket.emit("gameCode", { code });
+    } catch (err) {
+      console.error("Error in createGame:", err);
+      socket.emit("errorMessage", { message: "Failed to create game." });
     }
-
-    io.to(code).emit("lobbyUpdate", {
-      players: room.players.map(p => ({ id: p.id, name: p.name })),
-      hostId: room.hostId,
-      code,
-    });
-    cb && cb({ ok: true, id, isHost: socket.id === room.hostId });
   });
 
-  socket.on("startGame", ({ code }, cb) => {
-    code = String(code || "").toUpperCase();
-    const room = rooms.get(code);
-    if (!room) return cb && cb({ ok: false, error: "Room not found" });
-    if (socket.id !== room.hostId) return cb && cb({ ok: false, error: "Only host can start" });
-    if (room.players.length < 2) return cb && cb({ ok: false, error: "Need at least 2 players" });
+  // Player joins an existing game by code
+  socket.on("joinGame", ({ code, name }) => {
+    try {
+      if (!code) {
+        socket.emit("joinError", { message: "No game code provided." });
+        return;
+      }
 
-    room.started = true;
-    room.currentTurnIndex = 0;
-    room.actionSeq = 1;
-    room.spinning = false;
-    room.firstFinisherAwarded = false;
+      const upperCode = code.toUpperCase();
+      const game = games[upperCode];
 
-    io.to(code).emit("gameStarted", {
-      players: room.players.map(p => ({ id: p.id, name: p.name })),
-      currentPlayerId: room.players[0].id,
-      seq: room.actionSeq
-    });
-    cb && cb({ ok: true });
-  });
+      if (!game) {
+        socket.emit("joinError", { message: "Game not found." });
+        return;
+      }
 
-  function ensureActive(room, playerId, sid) {
-    const pIdx = room.players.findIndex(p => p.id === playerId);
-    if (pIdx !== room.currentTurnIndex) return { ok: false, error: "Not your turn" };
-    const p = room.players[pIdx];
-    if (!p || p.sid !== sid) return { ok: false, error: "Identity mismatch" };
-    return { ok: true };
-  }
+      socket.join(upperCode);
 
-  function nextTurn(room) {
-    room.currentTurnIndex = (room.currentTurnIndex + 1) % room.players.length;
-    room.actionSeq += 1;
-    const currentPlayerId = room.players[room.currentTurnIndex].id;
-    io.to(room.code).emit("turnChanged", { currentPlayerId, seq: room.actionSeq });
-  }
+      const playerName = name && name.trim() ? name.trim() : "Player";
+      const player = { id: socket.id, name: playerName };
 
-  socket.on("requestMoveSpin", ({ code, playerId }, cb) => {
-    code = String(code || "").toUpperCase();
-    const room = rooms.get(code);
-    if (!room || !room.started) return cb && cb({ ok: false, error: "No game" });
+      // Only add once
+      if (!game.players.find((p) => p.id === socket.id)) {
+        game.players.push(player);
+      }
 
-    const auth = ensureActive(room, playerId, socket.id);
-    if (!auth.ok) return cb && cb({ ok: false, error: auth.error });
+      console.log(`Player joined game ${upperCode}:`, playerName);
 
-    if (room.spinning) return cb && cb({ ok: false, error: "Spin in progress" });
-    room.spinning = true;
+      // Notify everyone in the room about the updated lobby
+      io.to(upperCode).emit("lobbyUpdate", {
+        code: upperCode,
+        players: game.players,
+      });
 
-    const roll = Math.floor(Math.random() * 10) + 1;
-    const seq = ++room.actionSeq;
-    io.to(code).emit("serverMoveSpin", { playerId, roll, seq });
-
-    // unlock & advance turn after client resolves (give it enough time to animate)
-    setTimeout(() => {
-      room.spinning = false;
-      nextTurn(room);
-    }, 4500);
-
-    cb && cb({ ok: true, roll, seq });
-  });
-
-  socket.on("requestExtraSpin", ({ code, playerId, multiplier }, cb) => {
-    code = String(code || "").toUpperCase();
-    const room = rooms.get(code);
-    if (!room || !room.started) return cb && cb({ ok: false });
-    // Allow extra spins only for the player whose action is being resolved (same turn index)
-    const auth = ensureActive(room, playerId, socket.id);
-    if (!auth.ok && room.spinning) {
-      // If we're currently spinning for this player's action, permit extra spin
-      // (often triggered as part of TARD/payoff/extortion chaining)
+      // Acknowledge to the joining player
+      socket.emit("joinedGame", {
+        code: upperCode,
+        player,
+      });
+    } catch (err) {
+      console.error("Error in joinGame:", err);
+      socket.emit("joinError", { message: "Failed to join game." });
     }
-
-    const roll = Math.floor(Math.random() * 10) + 1;
-    const amount = roll * (Number(multiplier) || 1);
-    const seq = ++room.actionSeq;
-    io.to(code).emit("serverExtraSpin", { playerId, roll, amount, multiplier, seq });
-    cb && cb({ ok: true, roll, amount, seq });
   });
 
-  socket.on("requestRescueSpin", ({ code, playerId }, cb) => {
-    code = String(code || "").toUpperCase();
-    const room = rooms.get(code);
-    if (!room || !room.started) return cb && cb({ ok: false });
+  // Host starts the game
+  socket.on("startGame", ({ code }) => {
+    try {
+      if (!code) return;
 
-    const roll = Math.floor(Math.random() * 10) + 1;
-    const seq = ++room.actionSeq;
-    io.to(code).emit("serverRescueSpin", { playerId, roll, seq });
-    cb && cb({ ok: true, roll, seq });
-  });
+      const upperCode = code.toUpperCase();
+      const game = games[upperCode];
 
-  socket.on("requestTardDraw", ({ code, playerId }, cb) => {
-    code = String(code || "").toUpperCase();
-    const room = rooms.get(code);
-    if (!room || !room.started) return cb && cb({ ok: false, error: "No game" });
+      if (!game) return;
+      if (game.hostId !== socket.id) {
+        console.log("Non-host tried to start game", socket.id);
+        return;
+      }
 
-    if (!room.tardDeck?.length) return cb && cb({ ok: false, error: "No deck" });
-    if (room.tardPtr >= room.tardDeck.length) {
-      room.tardDeck = [...room.tardDeck].sort(() => Math.random() - 0.5);
-      room.tardPtr = 0;
+      game.started = true;
+
+      console.log(`Game started: ${upperCode}`);
+
+      // Tell all clients in this game that the game has started.
+      // Your client can listen for "gameStarted" to show the board.
+      io.to(upperCode).emit("gameStarted", {
+        code: upperCode,
+        players: game.players,
+        currentTurnIndex: 0,
+      });
+    } catch (err) {
+      console.error("Error in startGame:", err);
+      socket.emit("errorMessage", { message: "Failed to start game." });
     }
-    const card = room.tardDeck[room.tardPtr++];
-    const remaining = room.tardDeck.length - room.tardPtr;
-    const seq = ++room.actionSeq;
-    io.to(code).emit("serverTardDraw", { playerId, card, remaining, seq });
-    cb && cb({ ok: true, card, remaining, seq });
   });
 
-  socket.on("claimFinishBonus", ({ code, playerId }, cb) => {
-    code = String(code || "").toUpperCase();
-    const room = rooms.get(code);
-    if (!room || !room.started) return cb && cb({ ok: false });
-    if (room.firstFinisherAwarded) return cb && cb({ ok: false, already: true });
-    room.firstFinisherAwarded = true;
-    const seq = ++room.actionSeq;
-    io.to(code).emit("finishBonusAwarded", { playerId, amount: 5000, seq });
-    cb && cb({ ok: true, amount: 5000, seq });
+  // Optional: a basic handler for spin events if you wire it later
+  socket.on("spin", ({ code, roll, playerId }) => {
+    try {
+      if (!code) return;
+      const upperCode = code.toUpperCase();
+      const game = games[upperCode];
+      if (!game || !game.started) return;
+
+      // Just broadcast the spin result to everyone in the room.
+      // Your front end already handles moving pieces and TTS.
+      io.to(upperCode).emit("spinResult", {
+        code: upperCode,
+        roll,
+        playerId,
+      });
+    } catch (err) {
+      console.error("Error in spin:", err);
+    }
   });
 
+  // Handle disconnect
   socket.on("disconnect", () => {
-    for (const [code, room] of rooms) {
-      const before = room.players.length;
-      room.players = room.players.filter(p => p.sid !== socket.id);
-      if (before !== room.players.length) {
+    console.log("Client disconnected:", socket.id);
+
+    // Remove from any games they were in
+    for (const code of Object.keys(games)) {
+      const game = games[code];
+      const before = game.players.length;
+      game.players = game.players.filter((p) => p.id !== socket.id);
+
+      // If host left or no players remain, delete the game
+      if (game.hostId === socket.id || game.players.length === 0) {
+        console.log(`Deleting game ${code} because host/players left`);
+        delete games[code];
+      } else if (before !== game.players.length) {
+        // Lobby update after player leaves
         io.to(code).emit("lobbyUpdate", {
-          players: room.players.map(p => ({ id: p.id, name: p.name })),
-          hostId: room.hostId,
           code,
+          players: game.players,
         });
       }
-      // Host handoff in lobby
-      if (!room.started && room.players.length && room.hostId === socket.id) {
-        room.hostId = room.players[0].sid;
-        io.to(code).emit("lobbyUpdate", {
-          players: room.players.map(p => ({ id: p.id, name: p.name })),
-          hostId: room.hostId,
-          code,
-        });
-      }
-      if (!room.players.length) rooms.delete(code);
     }
   });
 });
 
-server.listen(PORT, () => console.log(`Lowlife online fixed running on :${PORT}`));
+// ----- Start server -----
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => {
+  console.log(`LowLife server listening on port ${PORT}`);
+});
