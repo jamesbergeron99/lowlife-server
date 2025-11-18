@@ -1,124 +1,108 @@
-const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
-const cors = require("cors");
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>LowLife Multiplayer</title>
+<style>
+  body { background:#111; color:white; font-family:Arial; text-align:center; }
+  #board { display:grid; grid-template-columns:repeat(20,1fr); gap:4px; width:90%; margin:20px auto; }
+  .sq { height:45px; background:#333; display:flex; align-items:center; justify-content:center; }
+  .p { background:yellow; color:black; padding:2px 4px; border-radius:4px; }
+</style>
+</head>
+<body>
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+<h1>The Game of LowLife</h1>
+<button id="createBtn">Create Game</button>
+<input id="codeInput" placeholder="Enter Code">
+<input id="nameInput" placeholder="Your Name">
+<button id="joinBtn">Join Game</button>
 
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+<h2 id="gameCode"></h2>
+<button id="startBtn" style="display:none;">Start Game</button>
+<button id="spinBtn" style="display:none;">SPIN</button>
 
-let games = {};   // gameId → state
-let sockets = {}; // socket → gameId
+<div id="turn"></div>
+<div id="board"></div>
 
-function generateCode() {
-  return Math.random().toString(36).substring(2, 8).toUpperCase();
+<script>
+let ws = new WebSocket("wss://" + window.location.host);
+let playerId = null;
+let gameCode = null;
+
+const board = document.getElementById("board");
+
+function buildBoard() {
+  board.innerHTML = "";
+  for (let i = 1; i <= 100; i++) {
+    const d = document.createElement("div");
+    d.className = "sq";
+    d.id = "sq" + i;
+    d.textContent = i;
+    if (i === 99) d.style.background = "red";
+    if (i === 100) d.style.background = "gold";
+    board.appendChild(d);
+  }
 }
 
-wss.on("connection", (ws) => {
-  ws.on("message", (msg) => {
-    let data;
-    try {
-      data = JSON.parse(msg);
-    } catch (e) {
-      return;
-    }
+buildBoard();
 
-    if (data.type === "create") {
-      const id = generateCode();
-      games[id] = {
-        gameId: id,
-        players: {},
-        turn: null,
-        state: "LOBBY",
-        firstFinisherAwarded: false
-      };
-      sockets[ws] = id;
-      ws.send(JSON.stringify({ type: "created", gameId: id }));
-    }
+ws.onmessage = e => {
+  const m = JSON.parse(e.data);
 
-    if (data.type === "join") {
-      const id = data.gameId;
-      if (!games[id]) {
-        ws.send(JSON.stringify({ type: "error", message: "Game not found" }));
-        return;
-      }
+  if (m.type === "created") {
+    document.getElementById("gameCode").textContent = "Game Code: " + m.code;
+    gameCode = m.code;
+  }
 
-      sockets[ws] = id;
+  if (m.type === "joined") {
+    playerId = m.id;
+    gameCode = document.getElementById("codeInput").value;
+    update(m.game);
+    document.getElementById("startBtn").style.display = "block";
+  }
 
-      const pid = Math.random().toString(36).substring(2, 10);
-      games[id].players[pid] = {
-        id: pid,
-        name: "Player " + (Object.keys(games[id].players).length + 1),
-        position: 0,
-        money: 0,
-        family: 0,
-        miss: false,
-        color: ["#f44336", "#2196f3", "#4caf50", "#ff9800"][Object.keys(games[id].players).length % 4]
-      };
+  if (m.type === "update") update(m.game);
+};
 
-      if (!games[id].turn) {
-        games[id].turn = pid;
-      }
+function update(g) {
+  buildBoard();
 
-      ws.send(JSON.stringify({ type: "joined", playerId: pid }));
-      broadcast(id);
-    }
+  // Render players
+  for (let id in g.players) {
+    const p = g.players[id];
+    const sq = document.getElementById("sq" + (p.position+1));
+    sq.innerHTML = (p.position+1) + " <span class='p'>" + p.name[0] + "</span>";
+  }
 
-    if (data.type === "start") {
-      const id = sockets[ws];
-      if (!games[id]) return;
+  document.getElementById("turn").textContent =
+    "Current Turn: " + g.players[g.turn].name;
 
-      games[id].state = "PLAYING";
-      broadcast(id);
-    }
-
-    if (data.type === "spin") {
-      const id = sockets[ws];
-      if (!games[id]) return;
-
-      const roll = Math.floor(Math.random() * 10) + 1;
-      const pid = data.playerId;
-      const p = games[id].players[pid];
-
-      p.position += roll;
-      if (p.position >= 99) {
-        if (!games[id].firstFinisherAwarded) {
-          p.money += 5000;
-          games[id].firstFinisherAwarded = true;
-        }
-        p.position = 99;
-      }
-
-      const order = Object.keys(games[id].players);
-      const next = (order.indexOf(pid) + 1) % order.length;
-      games[id].turn = order[next];
-
-      broadcast(id);
-    }
-  });
-
-  ws.on("close", () => {
-    const id = sockets[ws];
-    delete sockets[ws];
-  });
-});
-
-function broadcast(gameId) {
-  const msg = JSON.stringify({
-    type: "state",
-    state: games[gameId]
-  });
-
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN && sockets[client] === gameId) {
-      client.send(msg);
-    }
-  });
+  if (g.state === "playing") {
+    document.getElementById("spinBtn").style.display = "inline-block";
+  }
 }
 
-server.listen(process.env.PORT || 3000, () => {
-  console.log("Server running.");
-});
+document.getElementById("createBtn").onclick = () => {
+  ws.send(JSON.stringify({ type:"create" }));
+};
+
+document.getElementById("joinBtn").onclick = () => {
+  ws.send(JSON.stringify({
+    type:"join",
+    code: document.getElementById("codeInput").value,
+    name: document.getElementById("nameInput").value
+  }));
+};
+
+document.getElementById("startBtn").onclick = () => {
+  ws.send(JSON.stringify({ type:"start", code: gameCode }));
+};
+
+document.getElementById("spinBtn").onclick = () => {
+  ws.send(JSON.stringify({ type:"spin", code: gameCode, playerId }));
+};
+</script>
+
+</body>
+</html>
