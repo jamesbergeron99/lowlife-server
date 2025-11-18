@@ -5,13 +5,11 @@ const http = require("http");
 const { Server } = require("socket.io");
 const cors = require("cors");
 
-// ----- Basic Express setup -----
+// ----- Express setup -----
 const app = express();
-
-// Allow JSON if you ever add REST endpoints
 app.use(express.json());
 
-// CORS for any origin (we can tighten this later if you want)
+// CORS: allow any origin (GitHub Pages, Render, etc.)
 app.use(
   cors({
     origin: "*",
@@ -19,17 +17,17 @@ app.use(
   })
 );
 
-// Simple health check (so hitting the root URL doesn't 404)
+// Simple root route so you don't get "Cannot GET /"
 app.get("/", (req, res) => {
   res.send("LowLife server is running.");
 });
 
-// ----- Create HTTP + Socket.IO server -----
+// ----- HTTP + Socket.IO server -----
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "*", // IMPORTANT: this avoids the Access-Control-Allow-Origin mismatch
+    origin: "*",
     methods: ["GET", "POST"],
   },
 });
@@ -38,9 +36,9 @@ const io = new Server(server, {
 // games[code] = { code, hostId, players: [{ id, name }], started: false }
 const games = {};
 
-// Utility to generate a 5-character game code (e.g., AB3D9)
+// Generate a random 5-character game code
 function generateGameCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoid confusing chars
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
   for (let i = 0; i < 5; i++) {
     code += chars[Math.floor(Math.random() * chars.length)];
@@ -48,7 +46,6 @@ function generateGameCode() {
   return code;
 }
 
-// Make sure code is unique (for this server instance)
 function createUniqueCode() {
   let code;
   do {
@@ -57,11 +54,21 @@ function createUniqueCode() {
   return code;
 }
 
+// Convenience to build a code payload with *multiple* property names
+function buildCodePayload(code) {
+  return {
+    code,          // generic
+    gameCode: code,
+    roomCode: code,
+    lobbyCode: code,
+  };
+}
+
 // ----- Socket.IO logic -----
 io.on("connection", (socket) => {
   console.log("Client connected:", socket.id);
 
-  // Host creates a game
+  // Host creates a new game
   socket.on("createGame", (payload) => {
     try {
       const code = createUniqueCode();
@@ -77,19 +84,38 @@ io.on("connection", (socket) => {
 
       console.log(`Game created: ${code} by host ${socket.id}`);
 
-      // Send code back to the creator
-      // (Your client should listen for either "gameCreated" or "gameCode")
-      socket.emit("gameCreated", { code });
-      socket.emit("gameCode", { code });
+      const payloadOut = buildCodePayload(code);
+
+      // Fire as many likely events/properties as possible
+      socket.emit("gameCreated", payloadOut);
+      socket.emit("gameCode", payloadOut);
+      socket.emit("createdGame", payloadOut);
     } catch (err) {
       console.error("Error in createGame:", err);
       socket.emit("errorMessage", { message: "Failed to create game." });
     }
   });
 
-  // Player joins an existing game by code
-  socket.on("joinGame", ({ code, name }) => {
+  // Player joins an existing game
+  socket.on("joinGame", (data) => {
     try {
+      // Accept various shapes: { code }, { gameCode }, string, etc.
+      let code;
+      let name;
+
+      if (typeof data === "string") {
+        code = data;
+        name = "Player";
+      } else if (data) {
+        code =
+          data.code ||
+          data.gameCode ||
+          data.roomCode ||
+          data.lobbyCode ||
+          "";
+        name = data.name || data.playerName || "Player";
+      }
+
       if (!code) {
         socket.emit("joinError", { message: "No game code provided." });
         return;
@@ -105,25 +131,26 @@ io.on("connection", (socket) => {
 
       socket.join(upperCode);
 
-      const playerName = name && name.trim() ? name.trim() : "Player";
-      const player = { id: socket.id, name: playerName };
+      const trimmedName = name.toString().trim() || "Player";
+      const player = { id: socket.id, name: trimmedName };
 
-      // Only add once
       if (!game.players.find((p) => p.id === socket.id)) {
         game.players.push(player);
       }
 
-      console.log(`Player joined game ${upperCode}:`, playerName);
+      console.log(`Player joined game ${upperCode}: ${trimmedName}`);
 
-      // Notify everyone in the room about the updated lobby
-      io.to(upperCode).emit("lobbyUpdate", {
-        code: upperCode,
+      const lobbyPayload = {
+        ...buildCodePayload(upperCode),
         players: game.players,
-      });
+      };
 
-      // Acknowledge to the joining player
+      // Update lobby for everyone
+      io.to(upperCode).emit("lobbyUpdate", lobbyPayload);
+
+      // Acknowledge join
       socket.emit("joinedGame", {
-        code: upperCode,
+        ...buildCodePayload(upperCode),
         player,
       });
     } catch (err) {
@@ -133,16 +160,36 @@ io.on("connection", (socket) => {
   });
 
   // Host starts the game
-  socket.on("startGame", ({ code }) => {
+  socket.on("startGame", (data) => {
     try {
-      if (!code) return;
+      let code;
+
+      if (typeof data === "string") {
+        code = data;
+      } else if (data) {
+        code =
+          data.code ||
+          data.gameCode ||
+          data.roomCode ||
+          data.lobbyCode ||
+          "";
+      }
+
+      if (!code) {
+        console.log("startGame called without a code");
+        return;
+      }
 
       const upperCode = code.toUpperCase();
       const game = games[upperCode];
 
-      if (!game) return;
+      if (!game) {
+        console.log("startGame called for non-existing game:", upperCode);
+        return;
+      }
+
       if (game.hostId !== socket.id) {
-        console.log("Non-host tried to start game", socket.id);
+        console.log("Non-host tried to start game:", socket.id);
         return;
       }
 
@@ -150,31 +197,47 @@ io.on("connection", (socket) => {
 
       console.log(`Game started: ${upperCode}`);
 
-      // Tell all clients in this game that the game has started.
-      // Your client can listen for "gameStarted" to show the board.
-      io.to(upperCode).emit("gameStarted", {
-        code: upperCode,
+      const startPayload = {
+        ...buildCodePayload(upperCode),
         players: game.players,
         currentTurnIndex: 0,
-      });
+        started: true,
+      };
+
+      // Let all clients know the game has started (front end should listen for this)
+      io.to(upperCode).emit("gameStarted", startPayload);
     } catch (err) {
       console.error("Error in startGame:", err);
       socket.emit("errorMessage", { message: "Failed to start game." });
     }
   });
 
-  // Optional: a basic handler for spin events if you wire it later
-  socket.on("spin", ({ code, roll, playerId }) => {
+  // Spin handler (optional – just broadcasts the result)
+  socket.on("spin", (data) => {
     try {
+      let code;
+      let roll;
+      let playerId;
+
+      if (data) {
+        code =
+          data.code ||
+          data.gameCode ||
+          data.roomCode ||
+          data.lobbyCode ||
+          "";
+        roll = data.roll;
+        playerId = data.playerId;
+      }
+
       if (!code) return;
+
       const upperCode = code.toUpperCase();
       const game = games[upperCode];
       if (!game || !game.started) return;
 
-      // Just broadcast the spin result to everyone in the room.
-      // Your front end already handles moving pieces and TTS.
       io.to(upperCode).emit("spinResult", {
-        code: upperCode,
+        ...buildCodePayload(upperCode),
         roll,
         playerId,
       });
@@ -187,22 +250,21 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log("Client disconnected:", socket.id);
 
-    // Remove from any games they were in
     for (const code of Object.keys(games)) {
       const game = games[code];
       const before = game.players.length;
+
       game.players = game.players.filter((p) => p.id !== socket.id);
 
-      // If host left or no players remain, delete the game
       if (game.hostId === socket.id || game.players.length === 0) {
         console.log(`Deleting game ${code} because host/players left`);
         delete games[code];
       } else if (before !== game.players.length) {
-        // Lobby update after player leaves
-        io.to(code).emit("lobbyUpdate", {
-          code,
+        const lobbyPayload = {
+          ...buildCodePayload(code),
           players: game.players,
-        });
+        };
+        io.to(code).emit("lobbyUpdate", lobbyPayload);
       }
     }
   });
