@@ -1,108 +1,154 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>LowLife Multiplayer</title>
-<style>
-  body { background:#111; color:white; font-family:Arial; text-align:center; }
-  #board { display:grid; grid-template-columns:repeat(20,1fr); gap:4px; width:90%; margin:20px auto; }
-  .sq { height:45px; background:#333; display:flex; align-items:center; justify-content:center; }
-  .p { background:yellow; color:black; padding:2px 4px; border-radius:4px; }
-</style>
-</head>
-<body>
+// -------------------------------
+// The Game of LowLife - SERVER
+// WebSocket Multiplayer Version
+// -------------------------------
 
-<h1>The Game of LowLife</h1>
-<button id="createBtn">Create Game</button>
-<input id="codeInput" placeholder="Enter Code">
-<input id="nameInput" placeholder="Your Name">
-<button id="joinBtn">Join Game</button>
+const http = require("http");
+const WebSocket = require("ws");
 
-<h2 id="gameCode"></h2>
-<button id="startBtn" style="display:none;">Start Game</button>
-<button id="spinBtn" style="display:none;">SPIN</button>
+// Render uses process.env.PORT
+const PORT = process.env.PORT || 3000;
 
-<div id="turn"></div>
-<div id="board"></div>
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
 
-<script>
-let ws = new WebSocket("wss://" + window.location.host);
-let playerId = null;
-let gameCode = null;
+// All games stored in memory
+const games = {};
 
-const board = document.getElementById("board");
-
-function buildBoard() {
-  board.innerHTML = "";
-  for (let i = 1; i <= 100; i++) {
-    const d = document.createElement("div");
-    d.className = "sq";
-    d.id = "sq" + i;
-    d.textContent = i;
-    if (i === 99) d.style.background = "red";
-    if (i === 100) d.style.background = "gold";
-    board.appendChild(d);
-  }
+function generateGameCode() {
+  return Math.random().toString(36).substring(2, 7).toUpperCase();
 }
 
-buildBoard();
+// Characters with payday
+const CHARACTERS = [
+  { name: "Slum Lord", payday: 2500 },
+  { name: "Gold Digger", payday: 2000 },
+  { name: "Pimp", payday: 3000 },
+  { name: "Drug Dealer", payday: 2500 },
+  { name: "Pornstar", payday: 2500 },
+  { name: "Porn Producer", payday: 2500 },
+  { name: "Online Influencer", payday: 2500 },
+  { name: "Dirty Cop", payday: 2500 }
+];
 
-ws.onmessage = e => {
-  const m = JSON.parse(e.data);
-
-  if (m.type === "created") {
-    document.getElementById("gameCode").textContent = "Game Code: " + m.code;
-    gameCode = m.code;
-  }
-
-  if (m.type === "joined") {
-    playerId = m.id;
-    gameCode = document.getElementById("codeInput").value;
-    update(m.game);
-    document.getElementById("startBtn").style.display = "block";
-  }
-
-  if (m.type === "update") update(m.game);
-};
-
-function update(g) {
-  buildBoard();
-
-  // Render players
-  for (let id in g.players) {
-    const p = g.players[id];
-    const sq = document.getElementById("sq" + (p.position+1));
-    sq.innerHTML = (p.position+1) + " <span class='p'>" + p.name[0] + "</span>";
-  }
-
-  document.getElementById("turn").textContent =
-    "Current Turn: " + g.players[g.turn].name;
-
-  if (g.state === "playing") {
-    document.getElementById("spinBtn").style.display = "inline-block";
-  }
+function randomCharacter() {
+  return CHARACTERS[Math.floor(Math.random() * CHARACTERS.length)];
 }
 
-document.getElementById("createBtn").onclick = () => {
-  ws.send(JSON.stringify({ type:"create" }));
-};
+function broadcast(gameId, payload) {
+  wss.clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN && ws.gameId === gameId) {
+      ws.send(JSON.stringify(payload));
+    }
+  });
+}
 
-document.getElementById("joinBtn").onclick = () => {
-  ws.send(JSON.stringify({
-    type:"join",
-    code: document.getElementById("codeInput").value,
-    name: document.getElementById("nameInput").value
-  }));
-};
+wss.on("connection", ws => {
 
-document.getElementById("startBtn").onclick = () => {
-  ws.send(JSON.stringify({ type:"start", code: gameCode }));
-};
+  ws.on("message", msg => {
+    const data = JSON.parse(msg);
 
-document.getElementById("spinBtn").onclick = () => {
-  ws.send(JSON.stringify({ type:"spin", code: gameCode, playerId }));
-};
-</script>
+    // -----------------------------
+    // CREATE GAME
+    // -----------------------------
+    if (data.type === "createGame") {
+      const gameId = generateGameCode();
 
-</body>
-</html>
+      games[gameId] = {
+        state: "LOBBY",
+        players: {},
+        turn: null
+      };
+
+      ws.gameId = gameId;
+
+      ws.send(JSON.stringify({
+        type: "gameCreated",
+        gameId
+      }));
+    }
+
+    // -----------------------------
+    // JOIN GAME
+    // -----------------------------
+    if (data.type === "joinGame") {
+      const { gameId, playerName } = data;
+
+      if (!games[gameId]) {
+        ws.send(JSON.stringify({
+          type: "error",
+          msg: "Game not found."
+        }));
+        return;
+      }
+
+      ws.gameId = gameId;
+      ws.playerId = Date.now().toString();
+
+      games[gameId].players[ws.playerId] = {
+        id: ws.playerId,
+        name: playerName || "Player",
+        position: 0,
+        money: 0,
+        family: 0,
+        character: randomCharacter()
+      };
+
+      broadcast(gameId, {
+        type: "playerList",
+        players: games[gameId].players
+      });
+    }
+
+    // -----------------------------
+    // START GAME
+    // -----------------------------
+    if (data.type === "startGame") {
+      const game = games[data.gameId];
+      if (!game) return;
+
+      game.state = "PLAYING";
+
+      // First player is first key
+      game.turn = Object.keys(game.players)[0];
+
+      broadcast(data.gameId, {
+        type: "gameStarted",
+        turn: game.turn,
+        players: game.players
+      });
+    }
+
+    // -----------------------------
+    // SPIN
+    // -----------------------------
+    if (data.type === "spin") {
+      const { gameId, playerId } = data;
+      const game = games[gameId];
+      if (!game) return;
+
+      if (game.turn !== playerId) return;
+
+      const roll = Math.floor(Math.random() * 10) + 1;
+
+      const p = game.players[playerId];
+      p.position = (p.position + roll) % 100;
+
+      const ids = Object.keys(game.players);
+      const idx = ids.indexOf(game.turn);
+      game.turn = ids[(idx + 1) % ids.length];
+
+      broadcast(gameId, {
+        type: "gameState",
+        players: game.players,
+        turn: game.turn
+      });
+    }
+
+  });
+
+});
+
+server.listen(PORT, () => {
+  console.log("SERVER RUNNING on port " + PORT);
+});
