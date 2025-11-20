@@ -1,183 +1,177 @@
-const WebSocket = require('ws');
-const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const cors = require('cors');
 
-// --- GAME DATA ---
-const EVENTS = [
-    "Start", "Payday", "Lose $500", "Space 4", "Space 5", 
-    "Payday", "Spin times 100", "Tard card", "Lottery spin 5 to win", 
-    "Payday", "Gain a family member", "Lose job", "Payday", "Finish"
-];
-const TARD_CARDS = [
-    "Payoff Card: Developer", "Lose 1 family member", 
-    "Go back 3 spaces", "Payoff Card: Manager"
-];
-const CHARACTERS = [
-    {name: "Dev", payday: 5000, paysOff: []}, 
-    {name: "Manager", payday: 8000, paysOff: ["Dev"]}
-];
-// ----------------
+const app = express();
+app.use(cors());
 
-const START_MONEY = 0;
-const START_FAMILY = 0;
-const games = new Map();
-
-function shuffle(array) {
-  for(let i = array.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [array[i], array[j]] = [array[j], array[i]];
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
   }
-  return array;
+});
+
+const PORT = process.env.PORT || 3000;
+
+// Store active rooms
+const rooms = new Map();
+
+function generateCode() {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  let result = "";
+  for (let i = 0; i < 4; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
 }
 
-function getRandomColor() {
-  const colors = ['#e53935','#8e24aa','#3949ab','#00acc1','#43a047','#fb8c00','#7b1fa2'];
-  return colors[Math.floor(Math.random() * colors.length)];
-}
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
 
-wss.on('connection', ws => {
-  let game = null;
-  let playerId = null;
-
-  ws.on('message', data => {
-    let msg;
-    try { msg = JSON.parse(data); } catch(e) { return; }
-
-    if(msg.type === 'joinGame') {
-      let gameId = msg.gameId || null;
-      const playerName = msg.playerName || 'Lowlife';
-
-      if(!gameId) gameId = Math.random().toString(36).substring(2,8).toUpperCase();
-
-      if(!games.has(gameId)) {
-        games.set(gameId, {
-          state: 'lobby',
-          gameId: gameId,
-          players: new Map(),
-          deck: shuffle([...TARD_CARDS]),
-          firstFinisher: null
-        });
-      }
-      game = games.get(gameId);
-      playerId = Math.random().toString(36).substring(2,12);
-      
-      game.players.set(playerId, {
-        ws: ws,
-        id: playerId,
-        name: playerName,
-        color: getRandomColor(),
-        position: 0,
-        money: START_MONEY,
-        family: START_FAMILY,
-        character: null,
-        missedNextPayday: false,
-        missedTurns: 0
-      });
-
-      ws.send(JSON.stringify({
-        type: 'welcome',
-        yourId: playerId,
-        gameId,
-        gameState: getGameState(game)
-      }));
-      broadcast(game, {type: 'gameUpdate', gameState: getGameState(game)});
-    }
-
-    if(msg.type === 'startGame' && game && game.state === 'lobby') {
-      game.state = 'playing';
-      const chars = shuffle([...CHARACTERS]);
-      let i = 0;
-      for(let p of game.players.values()) {
-        p.character = chars[i++ % chars.length];
-        p.money = START_MONEY;
-        p.family = START_FAMILY;
-        p.missedNextPayday = false;
-        p.missedTurns = 0;
-      }
-      game.turnIndex = Math.floor(Math.random() * game.players.size);
-      game.turnPlayerId = Array.from(game.players.keys())[game.turnIndex];
-      broadcast(game, {type: 'gameStarted', gameState: getGameState(game)});
-    }
-
-    if(msg.type === 'spin' && game && game.state === 'playing' && game.turnPlayerId === playerId && !game.currentRoll) {
-      const roll = Math.floor(Math.random() * 10) + 1;
-      game.currentRoll = roll;
-      broadcast(game, {type: 'roll', playerId, roll});
-      setTimeout(() => processMove(game, playerId, roll), 2000);
-    }
+  // 1. CREATE ROOM
+  socket.on('createRoom', (data, callback) => {
+    const code = generateCode();
+    rooms.set(code, {
+      code,
+      hostId: socket.id,
+      players: [],
+      state: 'lobby', // lobby, playing
+      turnIndex: 0,
+      tardDeck: [] // Will be seeded by host
+    });
+    callback({ ok: true, code });
   });
 
-  ws.on('close', () => {
-    if(game && playerId) {
-      game.players.delete(playerId);
-      if(game.players.size === 0) games.delete(game.gameId);
-      else broadcast(game, {type: 'gameUpdate', gameState: getGameState(game)});
+  // 2. JOIN ROOM
+  socket.on('joinRoom', ({ code, name, tardDeckSeed }, callback) => {
+    const room = rooms.get(code);
+    if (!room) {
+      return callback({ ok: false, error: "Room not found" });
     }
+    if (room.state !== 'lobby') {
+      return callback({ ok: false, error: "Game already started" });
+    }
+
+    // If host joins, seed the deck
+    if (socket.id === room.hostId && tardDeckSeed) {
+      room.tardDeck = [...tardDeckSeed];
+    }
+
+    const newPlayer = { id: socket.id, name, isHost: socket.id === room.hostId };
+    room.players.push(newPlayer);
+    socket.join(code);
+
+    // Notify everyone in room
+    io.to(code).emit('lobbyUpdate', {
+      players: room.players,
+      hostId: room.hostId,
+      code
+    });
+
+    callback({ ok: true, id: socket.id, isHost: newPlayer.isHost });
+  });
+
+  // 3. START GAME
+  socket.on('startGame', ({ code }, callback) => {
+    const room = rooms.get(code);
+    if (!room) return callback({ ok: false, error: "No room" });
+    if (socket.id !== room.hostId) return callback({ ok: false, error: "Not host" });
+
+    room.state = 'playing';
+    room.turnIndex = 0;
+
+    // Shuffle TARD deck on server start
+    if (room.tardDeck.length > 0) {
+      room.tardDeck.sort(() => Math.random() - 0.5);
+    }
+
+    io.to(code).emit('gameStarted', {
+      players: room.players,
+      currentPlayerId: room.players[0].id
+    });
+    callback({ ok: true });
+  });
+
+  // 4. REQUEST MOVE SPIN
+  socket.on('requestMoveSpin', ({ code, playerId }, callback) => {
+    const room = rooms.get(code);
+    if (!room) return;
+    
+    // Simple roll 1-10
+    const roll = Math.floor(Math.random() * 10) + 1;
+    
+    // Broadcast result so clients animate
+    io.to(code).emit('serverMoveSpin', { playerId, roll });
+
+    // Advance turn logic is handled on client visually, 
+    // but we update turn index here for the next person
+    const pIdx = room.players.findIndex(p => p.id === playerId);
+    if (pIdx !== -1) {
+      room.turnIndex = (pIdx + 1) % room.players.length;
+      // We wait a bit for animation (4s) then signal turn change? 
+      // Your client handles turn change logic visually, but we should sync it eventually.
+      // For now, we just let the client run the animation. 
+      // A robust server would set a timeout to emit 'turnChanged'.
+      setTimeout(() => {
+        io.to(code).emit('turnChanged', { 
+          currentPlayerId: room.players[room.turnIndex].id 
+        });
+      }, 5000); // 4s animation + buffer
+    }
+    if (callback) callback({ ok: true });
+  });
+
+  // 5. REQUEST EXTRA SPIN (Multipliers, etc)
+  socket.on('requestExtraSpin', ({ code, playerId, multiplier }, callback) => {
+    const roll = Math.floor(Math.random() * 10) + 1;
+    const amount = roll * (multiplier || 1);
+    io.to(code).emit('serverExtraSpin', { playerId, roll, amount, multiplier });
+    if (callback) callback({ ok: true });
+  });
+
+  // 6. REQUEST RESCUE SPIN (Bankruptcy)
+  socket.on('requestRescueSpin', ({ code, playerId }, callback) => {
+    const roll = Math.floor(Math.random() * 10) + 1;
+    io.to(code).emit('serverRescueSpin', { playerId, roll });
+    if (callback) callback({ ok: true });
+  });
+
+  // 7. DRAW TARD CARD
+  socket.on('requestTardDraw', ({ code, playerId }, callback) => {
+    const room = rooms.get(code);
+    if (!room) return;
+
+    let card = "No cards left!";
+    if (room.tardDeck.length > 0) {
+      card = room.tardDeck.pop();
+    }
+    
+    io.to(code).emit('serverTardDraw', { 
+      playerId, 
+      card, 
+      remaining: room.tardDeck.length 
+    });
+    if (callback) callback({ ok: true });
+  });
+
+  // 8. CLAIM FINISH BONUS
+  socket.on('claimFinishBonus', ({ code, playerId }, callback) => {
+    const room = rooms.get(code);
+    if (!room) return;
+    // Only give bonus to the first person who claims it? 
+    // Or logic handled by client. We just echo it.
+    io.to(code).emit('finishBonusAwarded', { playerId, amount: 5000 });
+  });
+
+  socket.on('disconnect', () => {
+    // Cleanup logic if needed
+    console.log('User disconnected:', socket.id);
   });
 });
 
-function broadcast(game, msg) {
-  if(!game) return;
-  game.players.forEach(p => {
-    if (p.ws && p.ws.readyState === WebSocket.OPEN) p.ws.send(JSON.stringify(msg));
-  });
-}
-
-function getGameState(game) {
-  const players = {};
-  game.players.forEach(p => {
-    players[p.id] = {
-      id: p.id,
-      name: p.name,
-      color: p.color,
-      character: p.character,
-      position: p.position,
-      money: p.money,
-      family: p.family
-    };
-  });
-  return { state: game.state, players, turn: game.turnPlayerId };
-}
-
-function processMove(game, playerId, roll) {
-  const player = game.players.get(playerId);
-  if(!player) return;
-
-  if(player.missedTurns > 0) {
-    player.missedTurns--;
-    broadcast(game, {type:'message', text: `${player.name} misses turn`});
-    nextTurn(game);
-    game.currentRoll = null;
-    return;
-  }
-  
-  if(player.missedNextPayday) player.missedNextPayday = false;
-  player.position += roll;
-  if (player.position >= EVENTS.length) player.position = EVENTS.length - 1;
-
-  let text = EVENTS[player.position];
-  if(text && text.includes('Payday') && player.character) {
-      player.money += player.character.payday;
-      broadcast(game, {type: 'message', text: 'PAYDAY!'});
-  }
-  
-  // Simple Tard Card Logic
-  if(text && text.includes('Tard card')) {
-      if(game.deck.length === 0) game.deck = shuffle([...TARD_CARDS]);
-      const card = game.deck.pop();
-      broadcast(game, {type: 'tardCard', playerId, card});
-  }
-
-  broadcast(game, {type:'gameUpdate', gameState: getGameState(game)});
-  game.currentRoll = null;
-  nextTurn(game);
-}
-
-function nextTurn(game) {
-  const ids = Array.from(game.players.keys());
-  game.turnIndex = (game.turnIndex + 1) % ids.length;
-  game.turnPlayerId = ids[game.turnIndex];
-  broadcast(game, {type:'gameUpdate', gameState: getGameState(game)});
-}
-
-console.log(`Server running on ${PORT}`);
+server.listen(PORT, () => {
+  console.log(`Lowlife Server running on port ${PORT}`);
+});
